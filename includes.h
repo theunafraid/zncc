@@ -16,7 +16,13 @@
 #include "lodepng.h"
 
 #ifdef GPU_SUPPORT
+
+#if defined(__APPLE__)
+#include <OpenCL/OpenCL.h>
+#else
 #include <CL/cl.h>
+#endif
+
 #include "clerrmacros.h"
 #endif
 
