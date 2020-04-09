@@ -1,6 +1,8 @@
 #ifndef ZNCC_H
 #define ZNCC_H
 
+#include <vector>
+
 #include "includes.h"
 
 #define TRUE	1
@@ -108,6 +110,23 @@ void	exec_project_cpu		(	const char *img0_arg,
 
 void   exec_project_gpu 		(	const char * const img0_arg,
 									const char * const img1_arg,
+									const int maximum_disparity = 64,
+									const int window_size = 9,
+									const int threshold = 8,
+									const int shrink_factor = 4,
+									const int neighbourhood_size = 8,
+									const int platform_number = 0,
+									const int device_number = 0
+								);
+
+void	zncc_gpu				(
+									unsigned char* imgData0,
+									unsigned char* imgData1,
+									const unsigned int width,
+									const unsigned int height,
+									std::vector<BYTE>& imgDataOut,
+									unsigned int& widthOut,
+									unsigned int& heightOut,
 									const int maximum_disparity = 64,
 									const int window_size = 9,
 									const int threshold = 8,

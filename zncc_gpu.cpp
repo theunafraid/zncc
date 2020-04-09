@@ -168,7 +168,7 @@ void exec_project_gpu	(	const char * const img0_arg,
 	{
 		handle_lodepng_error(error);
 	}
-	
+
 	if((im0_w != im1_w) || (im1_h != im1_h)){
 		printf("Image sizes mismatch.\n");
 		return;
@@ -344,6 +344,240 @@ void exec_project_gpu	(	const char * const img0_arg,
 	// Write output image to disk
 	lodepng::encode(	"outputs/depthmap.png"	, temp, result_w, result_h, LCT_GREY, 8U);
 
+
+	// Free buffers.
+	free(temp-reserve_size);
+	CL_CHECK(clReleaseMemObject(im0_raw_buffer));
+	CL_CHECK(clReleaseMemObject(im1_raw_buffer));
+	CL_CHECK(clReleaseMemObject(im0_small_buffer));
+	CL_CHECK(clReleaseMemObject(im1_small_buffer));
+	CL_CHECK(clReleaseMemObject(dmap1));
+	CL_CHECK(clReleaseMemObject(dmap2));
+	CL_CHECK(clReleaseKernel(kernel_sgrey));
+	CL_CHECK(clReleaseKernel(kernel_zncc));
+	CL_CHECK(clReleaseProgram(program));
+	CL_CHECK(clReleaseContext(context));
+
+}
+
+void	zncc_gpu				(
+									unsigned char* imgData0,
+									unsigned char* imgData1,
+									const unsigned int width,
+									const unsigned int height,
+									std::vector<BYTE>& imgDataOut,
+									unsigned int& widthOut,
+									unsigned int& heightOut,
+									const int maximum_disparity ,
+									const int window_size,
+									const int threshold,
+									const int shrink_factor,
+									const int neighbourhood_size,
+									const int platform_number,
+									const int device_number
+								)
+{
+	using namespace cl_objects;
+
+	// Default filepaths
+	char				s[512];
+	char				build_options[512]="";
+	const int 			half_win = (window_size-1)/2;
+
+	// In some places, `reserve_size' is used for better code understandability
+	const int &			reserve_size = maximum_disparity;
+
+	// Input images dimensions
+	unsigned int 		error;
+
+	// Dimensions, and number of elements, size of downscaled greyscale image.
+	unsigned int		num_elements_small;
+	int 				result_h, result_w;
+	int 				allocation_size;
+
+	// Passed to kernel to deal with negative disparity
+	int 				maxdisp_offset = 0;
+	BYTE *				zncc_kernel_src = NULL;
+	
+	// Size of scaled down images
+	result_h = int(height / shrink_factor);
+	result_w = int(width / shrink_factor);
+
+	////////////////////////////////////////////////////////////////////////////////////////
+	////////
+	//////// Optimizations. Using macro instead of constant variables enables compile-time
+	//////// optimizations, and hopefully better loop outrolling.
+	////////
+	////////////////////////////////////////////////////////////////////////////////////////
+	sprintf_s(build_options, sizeof(build_options), "-D WINDOW_SIZE=%d -D IMAGE_WIDTH=%d -D IMAGE_HEIGHT=%d -cl-mad-enable", window_size, result_w, result_h);
+
+
+	// Initialize on given platform, device with these build options.
+	opencl_init(platform_number, device_number, build_options);
+
+	// Create a blank buffer of size:    result_w  x  result_h (+2*reserveSize)
+	num_elements_small = result_h * result_w;
+	allocation_size = num_elements_small + 2*reserve_size; // For output small image
+	BYTE *temp = (BYTE *)(calloc(allocation_size, 1));
+	temp = temp + reserve_size;
+
+	// Set buffer region for subbuffers to be created (without the reserves on both ends)
+	buffer_region = cl_buffer_region{size_t(reserve_size), size_t(num_elements_small)};
+
+	// Create required buffers on GPU.
+	opencl_create_buffers(4 * width * height, allocation_size, imgData0, imgData1, temp);
+
+
+
+	////////////////////////////////////////////////////////////////
+	////////
+	//////// In, compute_disparity kernel:
+	////////
+	//////// Each workgroup has upto 64 work items, each with unique 'd' value
+	////////
+	//////// All work-items on same (x,y) points on image
+	////////
+	//////// This helps share left image mean and std in __local memory.
+	////////
+	////////////////////////////////////////////////////////////////
+
+	/* Presetting kernel args for little performance boost. */
+	size_t global_work_size_zncc[3]  =  { size_t(result_h), size_t(result_w), size_t(maximum_disparity)};
+
+	size_t local_size_zncc[3]        =  {                1,                1, size_t(maximum_disparity)};
+
+	size_t global_work_size_sgrey[2] =  { size_t(result_h), size_t(result_w) };
+
+	// Shrink and grey kernel
+	CL_CHECK(clSetKernelArg(kernel_sgrey, 0, sizeof(im0_raw_buffer), &im0_raw_buffer));
+	CL_CHECK(clSetKernelArg(kernel_sgrey, 1, sizeof(im1_raw_buffer), &im1_raw_buffer));
+	CL_CHECK(clSetKernelArg(kernel_sgrey, 2, sizeof(im0_sub_buffer), &im0_sub_buffer));
+	CL_CHECK(clSetKernelArg(kernel_sgrey, 3, sizeof(im1_sub_buffer), &im1_sub_buffer));
+	unsigned char 	sf_c = (unsigned char)shrink_factor;
+	CL_CHECK(clSetKernelArg(kernel_sgrey, 4, sizeof(sf_c), &sf_c));
+	CL_CHECK(clSetKernelArg(kernel_sgrey, 5, sizeof(width), &width));
+
+	// Preliminary depthmap 1 (compute_disparity)
+	CL_CHECK(clSetKernelArg(kernel_zncc, 0, sizeof(im0_sub_buffer), &im0_sub_buffer));
+	CL_CHECK(clSetKernelArg(kernel_zncc, 1, sizeof(im1_sub_buffer), &im1_sub_buffer));
+	CL_CHECK(clSetKernelArg(kernel_zncc, 2, sizeof(dmap1), &dmap1));
+	CL_CHECK(clSetKernelArg(kernel_zncc, 3, sizeof(result_w), &result_w));
+	CL_CHECK(clSetKernelArg(kernel_zncc, 4, sizeof(result_h), &result_h));
+	CL_CHECK(clSetKernelArg(kernel_zncc, 5, sizeof(window_size), &window_size));
+	CL_CHECK(clSetKernelArg(kernel_zncc, 6, sizeof(maxdisp_offset), &maxdisp_offset));
+
+
+	// Enqueue both consequtively.	
+	status_update("Shrink/grey...\n");
+	CL_CHECK(clEnqueueNDRangeKernel(queue, kernel_sgrey, 2, NULL, global_work_size_sgrey, NULL, 0, NULL, &kernel_completion[0]));
+	CL_CHECK(clEnqueueNDRangeKernel(queue, kernel_zncc, 3, NULL, global_work_size_zncc, local_size_zncc, 1, &kernel_completion[0], &kernel_completion[1]));
+
+	CL_CHECK((clWaitForEvents(1, &kernel_completion[0])));
+	// CL_CHECK(clReleaseEvent(kernel_completion[0]));
+	status_update("Computing depthmap 1 of 2\n");
+
+	CL_CHECK(clWaitForEvents(1, &kernel_completion[1]));
+	// CL_CHECK(clReleaseEvent(kernel_completion[1]));
+
+	//////// Same kernel, different set of args.
+	//////// So WAITING before we set another set of args.
+	//////// Can be changed to improve speed slightly.
+
+	// Set args for 2nd preliminary depthmap
+	// To deal with negative disparity
+	maxdisp_offset = -64;
+	CL_CHECK(clSetKernelArg(kernel_zncc, 0, sizeof(im1_sub_buffer), &im1_sub_buffer));
+	CL_CHECK(clSetKernelArg(kernel_zncc, 1, sizeof(im0_sub_buffer), &im0_sub_buffer));
+	CL_CHECK(clSetKernelArg(kernel_zncc, 2, sizeof(dmap2), &dmap2));
+	CL_CHECK(clSetKernelArg(kernel_zncc, 3, sizeof(result_w), &result_w));
+	CL_CHECK(clSetKernelArg(kernel_zncc, 4, sizeof(result_h), &result_h));
+	CL_CHECK(clSetKernelArg(kernel_zncc, 5, sizeof(window_size), &window_size));
+	CL_CHECK(clSetKernelArg(kernel_zncc, 6, sizeof(maxdisp_offset), &maxdisp_offset));
+
+	// Set args for cross-check
+	size_t global_work_size_cc[2]    =  { size_t(result_h), size_t(result_w) };
+	CL_CHECK(clSetKernelArg(kernel_cc, 0, sizeof(dmap1), &dmap1));
+	CL_CHECK(clSetKernelArg(kernel_cc, 1, sizeof(dmap2), &dmap2));
+	CL_CHECK(clSetKernelArg(kernel_cc, 2, sizeof(threshold), &threshold));
+
+	// Set args for occlusion-fill
+	size_t global_work_size_ofill[2] =	{
+	// 										Ignore boundaries with black (pixel value 0)
+											size_t(result_h) - 2 * half_win,
+											size_t(result_w) - 2 * half_win
+										};
+	CL_CHECK(clSetKernelArg(kernel_ofill, 0, sizeof(dmap1), &dmap1));
+	CL_CHECK(clSetKernelArg(kernel_ofill, 1, sizeof(half_win), &half_win));
+	CL_CHECK(clSetKernelArg(kernel_ofill, 2, sizeof(neighbourhood_size), &neighbourhood_size));
+	// Select cl_mem to copy from (variable added for easy debugging)
+	cl_mem copy_from_buf_cl = dmap1;
+
+
+	// Enque all the three kernels consecutively.
+	status_update("Computing depthmap 2 of 2\n");
+	CL_CHECK(clEnqueueNDRangeKernel(queue, kernel_zncc, 3, NULL, global_work_size_zncc, local_size_zncc, 0, NULL, &kernel_completion[2]));
+	CL_CHECK(clEnqueueNDRangeKernel(queue, kernel_cc, 2, NULL, global_work_size_cc, NULL, 1, &kernel_completion[2], &kernel_completion[3]));
+	CL_CHECK(clEnqueueNDRangeKernel(queue, kernel_ofill, 2, NULL, global_work_size_ofill, NULL, 1, &kernel_completion[3], &kernel_completion[4]));
+
+	// Enqueue copying to host memory from GPU memory.
+	CL_CHECK(clEnqueueReadBuffer(	queue,
+									copy_from_buf_cl,
+									CL_TRUE,
+									0 , //i*sizeof(int)
+									num_elements_small,
+									temp,
+									1,
+									&kernel_completion[4],
+									&kernel_completion[5]	));
+
+	CL_CHECK(clWaitForEvents(1, &kernel_completion[2]));
+	// CL_CHECK(clReleaseEvent(kernel_completion[2]));
+	status_update("Cross checking...\n");
+
+	CL_CHECK(clWaitForEvents(1, &kernel_completion[3]));
+	// CL_CHECK(clReleaseEvent(kernel_completion[3]));
+	status_update("Occlusion fill...\n");
+
+	CL_CHECK(clWaitForEvents(1, &kernel_completion[4]));
+	// CL_CHECK(clReleaseEvent(kernel_completion[4]));
+	status_update("Copying to host memory....\n");
+
+	CL_CHECK(clWaitForEvents(1, &kernel_completion[5]));
+	// CL_CHECK(clReleaseEvent(kernel_completion[5]));
+	status_update("Done.\n");
+
+	clFinish(queue);
+
+	cl_ulong time_start[6];
+	cl_ulong time_end[6];
+	double running_time[6];
+
+	for(int i=0; i<6; i++){
+		clGetEventProfilingInfo(kernel_completion[i], CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &time_start[i], NULL);
+		clGetEventProfilingInfo(kernel_completion[i], CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &time_end[i], NULL);
+		CL_CHECK(clReleaseEvent( kernel_completion[i] ));
+		running_time[i] = (time_end[i]-time_start[i])/1000000; // To ms
+	}
+
+	// Print timings on screen and append to file.
+	sprintf_s(s, sizeof(s), "echo \"$(date) ::  maxdisp = %02d;  winsize = %02d;  thres = %02d;  nhood = %02d, t_sg = %0.4lf ms;  t_d0 = %0.4lf ms;  t_d1 = %0.4lf ms;  t_cc = %0.4lf ms;  t_of = %0.4lf ms\n\"",
+				maximum_disparity, window_size, threshold, neighbourhood_size, running_time[0], running_time[1], running_time[2], running_time[3], running_time[4]);
+	system(s);
+	sprintf_s(s + strlen(s), sizeof(s), " >> \"%s\"", LOGFILE);
+	system(s);
+
+	// // Write output image to disk
+	// lodepng::encode(	"outputs/depthmap.png"	, temp, result_w, result_h, LCT_GREY, 8U);
+
+	int totalBytes = result_w * result_h;
+
+	for (int i = 0; i < totalBytes; ++i)
+	{
+		imgDataOut.push_back(temp[i]);
+	}
+
+	widthOut = result_w;
+	heightOut = result_h;
 
 	// Free buffers.
 	free(temp-reserve_size);
